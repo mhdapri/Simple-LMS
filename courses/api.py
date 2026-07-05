@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Optional
@@ -6,13 +7,42 @@ import jwt
 from django.conf import settings
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import Group, User
+from django.core.cache import cache
 from django.core.paginator import Paginator
 from django.shortcuts import get_object_or_404
+from django_ratelimit.decorators import ratelimit
 from ninja import NinjaAPI, Query, Schema
 from ninja.errors import HttpError
 from ninja.security import HttpBearer
+from pymongo import MongoClient
 
 from .models import Course, CourseContent, CourseMember, LessonProgress
+from .tasks import send_enrollment_email, generate_certificate
+
+
+def build_course_list_cache_key(page: int, page_size: int, search: Optional[str] = None, teacher_id: Optional[int] = None) -> str:
+    return f"courses:list:{page}:{page_size}:{search or ''}:{teacher_id or 0}"
+
+
+def get_mongo_collection(collection_name: str):
+    client = MongoClient(settings.MONGO_URI)
+    db = client[settings.MONGO_DB]
+    return db[collection_name]
+
+
+def log_activity(action: str, user_id: Optional[int] = None, course_id: Optional[int] = None, payload: Optional[dict] = None) -> None:
+    try:
+        collection = get_mongo_collection("activity_logs")
+        document = {
+            "action": action,
+            "user_id": user_id,
+            "course_id": course_id,
+            "payload": payload or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        collection.insert_one(document)
+    except Exception:
+        pass
 
 api = NinjaAPI(title="Simple LMS API", version="1.0.0", docs_url="/docs")
 
@@ -219,6 +249,7 @@ def register(request, payload: RegisterSchema):
 
 
 @api.post("/auth/login", response={200: TokenResponse}, tags=["auth"])
+@ratelimit(key="ip", rate=f"{settings.RATE_LIMIT_REQUESTS}/{settings.RATE_LIMIT_WINDOW}s", block=True)
 def login(request, payload: LoginSchema):
     user = authenticate(username=payload.username, password=payload.password)
     if not user:
@@ -286,7 +317,13 @@ def update_me(request, payload: RegisterSchema):
 
 
 @api.get("/courses", response=dict, tags=["courses"])
+@ratelimit(key="ip", rate=f"{settings.RATE_LIMIT_REQUESTS}/{settings.RATE_LIMIT_WINDOW}s", block=True)
 def list_courses(request, filters: CourseListQuery = Query(...)):
+    cache_key = build_course_list_cache_key(filters.page, filters.page_size, filters.search, filters.teacher_id)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     queryset = Course.objects.select_related("teacher").all()
 
     if filters.search:
@@ -312,18 +349,36 @@ def list_courses(request, filters: CourseListQuery = Query(...)):
         for course in page_obj.object_list
     ]
 
-    return {
+    response_payload = {
         "count": paginator.count,
         "page": filters.page,
         "page_size": filters.page_size,
         "results": results,
     }
+    cache.set(cache_key, response_payload, 300)
+    return response_payload
 
 
 @api.get("/courses/{course_id}", response=CourseOut, tags=["courses"])
 def course_detail(request, course_id: int):
+    cache_key = f"courses:detail:{course_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     course = get_object_or_404(Course.objects.select_related("teacher"), id=course_id)
-    return CourseOut(
+    payload = CourseOut(
+         id=course.id,
+         name=course.name,
+         description=course.description,
+         price=course.price,
+         teacher_id=course.teacher_id,
+         teacher_name=course.teacher.username,
+         created_at=course.created_at,
+         updated_at=course.updated_at,
+    )
+    cache.set(cache_key, payload, 300)
+    return payload
         id=course.id,
         name=course.name,
         description=course.description,
@@ -345,6 +400,9 @@ def create_course(request, payload: CourseCreateSchema):
         price=payload.price,
         teacher=user,
     )
+    cache.delete_many([build_course_list_cache_key(1, 10, None, None), build_course_list_cache_key(1, 5, None, None)])
+    cache.delete_pattern("courses:list:*")
+    log_activity("course_created", user_id=user.id, course_id=course.id)
     return 201, CourseOut(
         id=course.id,
         name=course.name,
@@ -368,6 +426,9 @@ def update_course(request, course_id: int, payload: CourseUpdateSchema):
     for field, value in payload.dict(exclude_unset=True).items():
         setattr(course, field, value)
     course.save()
+    cache.delete(f"courses:detail:{course.id}")
+    cache.delete_pattern("courses:list:*")
+    log_activity("course_updated", user_id=user.id, course_id=course.id)
     return CourseOut(
         id=course.id,
         name=course.name,
@@ -385,6 +446,9 @@ def update_course(request, course_id: int, payload: CourseUpdateSchema):
 def delete_course(request, course_id: int):
     course = get_object_or_404(Course, id=course_id)
     course.delete()
+    cache.delete_pattern("courses:list:*")
+    cache.delete(f"courses:detail:{course_id}")
+    log_activity("course_deleted", course_id=course_id)
     return {"deleted": True, "course_id": course_id}
 
 
@@ -398,6 +462,8 @@ def enroll_course(request, payload: EnrollmentCreateSchema):
         user_id=user,
         defaults={"roles": "std"},
     )
+    log_activity("enrolled", user_id=user.id, course_id=course.id)
+    send_enrollment_email.delay(user.id, course.id)
     return 201, {
         "message": "Enrolled successfully" if created else "Already enrolled",
         "course_id": course.id,
@@ -428,6 +494,9 @@ def mark_lesson_complete(request, course_id: int, payload: LessonProgressSchema)
     member = get_object_or_404(CourseMember, course_id=course, user_id=user)
     content = get_object_or_404(CourseContent, id=payload.content_id, course_id=course)
     progress, created = LessonProgress.objects.get_or_create(member=member, content=content)
+    log_activity("lesson_completed", user_id=user.id, course_id=course.id, payload={"content_id": content.id})
+    if created:
+        generate_certificate.delay(user.id, course.id)
     return {
         "message": "Lesson marked complete" if created else "Lesson already completed",
         "course_id": course.id,

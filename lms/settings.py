@@ -7,6 +7,7 @@ Melanjutkan dari Modul 04 (Django ORM) dengan tambahan:
 - Media files untuk ImageField dan FileField
 """
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -31,8 +32,10 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "silk",       # Django Silk - query profiling (Modul 05)
-    "courses",    # Aplikasi Simple LMS kita
+    "silk",
+    "django_celery_results",
+    "django_celery_beat",
+    "courses",
 ]
 
 
@@ -73,21 +76,29 @@ WSGI_APPLICATION = "lms.wsgi.application"
 
 
 # =============================================================================
-# Database - PostgreSQL (sesuai docker-compose.yml)
+# Database - PostgreSQL atau SQLite fallback untuk pengembangan lokal
 # =============================================================================
-# Berbeda dengan Lab-compliance yang menggunakan SQLite,
-# lab ini menggunakan PostgreSQL agar optimasi index terlihat nyata.
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "lms_db",
-        "USER": "postgres",
-        "PASSWORD": "postgres",
-        "HOST": "database",  # Nama service di docker-compose.yml
-        "PORT": "5432",
+USE_SQLITE = os.getenv("USE_SQLITE", "1") == "1"
+
+if USE_SQLITE:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("DB_NAME", "lms_db"),
+            "USER": os.getenv("DB_USER", "postgres"),
+            "PASSWORD": os.getenv("DB_PASSWORD", "postgres"),
+            "HOST": os.getenv("DB_HOST", "database"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+        }
+    }
 
 
 # =============================================================================
@@ -132,3 +143,35 @@ MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/")
+MONGO_DB = os.getenv("MONGO_DB", "lms_logs")
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
+    }
+}
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/2")
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+CELERY_BEAT_SCHEDULE = {
+    "update-course-statistics": {
+        "task": "courses.tasks.update_course_statistics",
+        "schedule": 60 * 60,
+    }
+}
+
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"

@@ -1,6 +1,9 @@
 from django.contrib.auth.models import Group, User
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
+
+from courses.api import build_course_list_cache_key
 
 
 class NinjaApiTests(TestCase):
@@ -57,3 +60,13 @@ class NinjaApiTests(TestCase):
         detail_response = self.client.get(f"/api/courses/{course.id}")
         self.assertEqual(detail_response.status_code, 200)
         self.assertEqual(detail_response.json()["id"], course.id)
+
+    def test_course_listing_is_cached(self):
+        cache.clear()
+        self.instructor.course_set.create(name="Caching Basics", description="Intro", price=10000)
+
+        response = self.client.get("/api/courses?page=1&page_size=5&search=caching")
+        self.assertEqual(response.status_code, 200)
+
+        cache_key = build_course_list_cache_key(page=1, page_size=5, search="caching", teacher_id=None)
+        self.assertIsNotNone(cache.get(cache_key))
